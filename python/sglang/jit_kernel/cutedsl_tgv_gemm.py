@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 # Copyright 2026 SGLang Team
 #
@@ -7,11 +8,6 @@
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
 """CuTe DSL TGV BF16 GEMM (low-latency Blackwell GEMM, SM100/SM103 only).
-
-Ported from FlashInfer PR #3281 (``flashinfer/gemm/kernels/tgv_gemm_cute_ext.py``),
-minus the autotuner: TGV-vs-cuBLAS dispatch and tactic selection are fixed
-heuristics derived from the shape grid of a B300 autotune cache and re-measured
-with CUPTI (see ``use_tgv_bf16_gemm`` / ``_pick_tactic``).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
 fp32 accumulation, bf16 output. The kernel writes M-contiguous output, so the
@@ -1259,47 +1255,62 @@ def _run_tgv(
     return out
 
 
-def _pick_tactic(m: int, n: int) -> int:
-    """Tactic heuristic: 2-CTA cta_m=64 configs only, with cta_n scaled by the
-    output size m*n (small-m weight-bound GEMMs want small cta_n for more load
-    parallelism; dense tiles want fatter cta_n). Matches the CUPTI-measured
-    best tactic (B300, cold L2) at every point where ``use_tgv_bf16_gemm``
-    returns True."""
-    mn = m * n
-    if m <= 16 or mn <= 128 * 1024:
-        return 18  # (64, 16, 12, 2cta)
-    if m <= 32 or mn <= 272 * 1024:
-        return 21  # (64, 32, 11, 2cta)
-    if mn <= 512 * 1024:
-        return 23  # (64, 64, 9, 2cta)
-    return 24  # (64, 128, 7, 2cta)
+_TGV_NUM_SMS = 148
+
+# (tactic, cta_m, cta_n, num_mma_ctas), smallest cta_n first.
+_TGV_TACTIC_LADDER = (
+    (18, 64, 16, 2),
+    (21, 64, 32, 2),
+    (23, 64, 64, 2),
+    (24, 64, 128, 2),
+    (12, 128, 16, 1),
+    (26, 128, 32, 2),
+    (27, 128, 64, 2),
+)
+
+
+def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int:
+    # Kernel axes are swapped: kernel-M = pytorch N, kernel-N = pytorch M.
+    cluster_m = cta_m * num_mma_ctas
+    return num_mma_ctas * -(n // -cluster_m) * -(m // -cta_n)
+
+
+def _pick_tactic(m: int, n: int, k: int) -> int:
+    """Pick the first ladder tactic whose grid fits one wave of the SMs."""
+    best, best_ctas = None, None
+    for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
+        ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
+        if ctas <= _TGV_NUM_SMS:
+            return tactic
+        if best_ctas is None or ctas < best_ctas:
+            best, best_ctas = tactic, ctas
+    return best
 
 
 def use_tgv_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
-    graph capture (cold L2), over the shape grid of the bf16_gemm autotune
-    cache. Conservative: ties and unmeasured regions fall back to cuBLAS.
-
-    Measured TGV-win regions per (n, k) family (best tactic vs F.linear):
-      (1024, 6144) 48<=m<=512; (2048, 6144) m<=128; (2624, 6144) m<=128;
-      (4096, 2048) m<=64; (6144, 4096) m<=32; (6144, 6144) m<=64;
-      (8192, 4096) m<=32; (12288, 6144) m<=32.
-    Washes (excluded): (2112, 7168) dsv3 qkv_a, (6144, 3072).
-    Losses everywhere: (160, 6144) small m, (6144, 512).
-    """
+    graph capture (cold L2). Conservative: ties and unmeasured regions fall
+    back to cuBLAS."""
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
     if n < 1024 or k < 2048 or k > 6144:
         return False
+    ragged = m % 16 != 0
     if n <= 1024:
-        return 48 <= m <= 512
+        return m <= 512 and (m >= 48 or m % 16 >= 9)
     if n <= 2624:
         return m <= 128 and k >= 4096
     if n <= 4096:
         return m <= 64
-    if m <= 32:
-        return k >= 4096 and n <= 12288
-    return m <= 64 and k >= 6144 and n <= 6144
+    if k < 4096:
+        return k >= 3072 and 25 <= m <= 48 and ragged
+    if n <= 6144:
+        if m <= 64:
+            return m <= 32 or k >= 6144 or ragged
+        return m <= 72 and k >= 6144 and ragged
+    if n <= 8192:
+        return m <= 48 or (m <= 63 and ragged)
+    return n <= 12288 and k >= 6144 and (m <= 32 or (m <= 48 and ragged))
 
 
 def _tgv_bf16_gemm_run(
@@ -1321,7 +1332,7 @@ def _tgv_bf16_gemm_run(
         bias,
         out,
         pdl=True,
-        tactic=_pick_tactic(x.shape[0], weight.shape[0]),
+        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
     )
 
 

@@ -65,8 +65,6 @@ if _is_npu:
 
 
 class Bf16GemmBackend(Enum):
-    """Backend for unquantized BF16 GEMM."""
-
     AUTO = "auto"
     TGV = "tgv"
 
@@ -83,7 +81,6 @@ _use_tgv_bf16_gemm = None
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
-    """Initialize the unquantized BF16 GEMM backend configuration."""
     global _BF16_GEMM_BACKEND, _tgv_bf16_gemm, _use_tgv_bf16_gemm
 
     backend = Bf16GemmBackend(server_args.bf16_gemm_backend)
@@ -103,7 +100,6 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
-    """Get the current unquantized BF16 GEMM backend."""
     global _BF16_GEMM_BACKEND
     if _BF16_GEMM_BACKEND is None:
         _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
