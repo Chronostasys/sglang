@@ -875,20 +875,22 @@ class Indexer(MultiPlatformOp):
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
-            # For target_verify/draft_extend, seqlens_32 is expanded (per-token);
-            # truncate to match the actual batch_size after q_offset truncation.
+            # For target_verify/draft_extend, seqlens_32 and block_tables are
+            # expanded per-token; truncate to match the actual batch_size
+            # after q_offset truncation (mirrors CUDA branch's block_tables[::next_n]).
             if (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 seqlens_32 = seqlens_32[:batch_size]
+                block_tables = block_tables[:batch_size]
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
                 logits,
                 seqlens_32,
-                block_tables[:batch_size],
+                block_tables,
                 max_seq_len,
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
